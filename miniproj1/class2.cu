@@ -121,16 +121,16 @@ void benchmark()
     // Exactly the same results as cuBLAS, but they are within tolerance
     for (int i = 0; i < ITER; ++i) {
 	cublasGemmEx(handle,
-		     CUBLAS_OP_T,  // ← read W^T so that its rows become columns
+		     CUBLAS_OP_T,
 		     CUBLAS_OP_N,
-		     Nn,           // m  Nn   =     (rows of W)
-		     1,            // n = 1         (columns of x)
-		     Ni,           // k = Ni
+		     Nn,
+		     1,
+		     Ni,
 		     &alpha,
-		     d_W, CUDA_R_16F, Ni,   // lda = Ni (row length)
-		     d_x, CUDA_R_16F, Ni,   // ldb = Ni
+		     d_W, CUDA_R_16F, Ni,
+		     d_x, CUDA_R_16F, Ni,
 		     &beta,
-		     d_y_ref, CUDA_R_16F, Nn,// ldc = Nn
+		     d_y_ref, CUDA_R_16F, Nn,
 		     CUDA_R_16F,
 		     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     }
