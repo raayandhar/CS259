@@ -1,6 +1,7 @@
 #include <cudnn.h>
 #include <torch/extension.h>
 #include <cuda_fp16.h>
+#include <tuple>
 
 #define checkCUDNN(expression)                             \
   {                                                        \
@@ -13,7 +14,7 @@
   }
 
 // Conv2d Layer 1 with cuDNN
-torch::Tensor launch_conv2d_cudnn_v1(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
+std::tuple<torch::Tensor, float> launch_conv2d_cudnn_v1(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
     constexpr int in_channels = 64; // Ni
     constexpr int in_height = 224; // Ny
     constexpr int in_width = 224; // Nx
@@ -27,115 +28,128 @@ torch::Tensor launch_conv2d_cudnn_v1(torch::Tensor input, torch::Tensor filters,
     int pad_height = 0;
     int pad_width = 0;
     
-    int out_height = (in_height - kernel_height + 2 * pad_height) / stride_height + 1;
-    int out_width = (in_width - kernel_width + 2 * pad_width) / stride_width + 1;
+    cudaSetDevice(0);
     
     cudnnHandle_t cudnn;
-    checkCUDNN(cudnnCreate(&cudnn));
+    cudnnCreate(&cudnn);
     
     cudnnTensorDescriptor_t input_descriptor;
     checkCUDNN(cudnnCreateTensorDescriptor(&input_descriptor));
-    checkCUDNN(cudnnSetTensor4dDescriptor(
-        input_descriptor,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        1, in_channels, in_height, in_width
-    ));
+    checkCUDNN(cudnnSetTensor4dDescriptor(input_descriptor,
+                                         CUDNN_TENSOR_NCHW,
+                                         CUDNN_DATA_HALF,
+                                         1,
+                                         in_channels,
+                                         in_height,
+                                         in_width));
+    
+    cudnnFilterDescriptor_t kernel_descriptor;
+    checkCUDNN(cudnnCreateFilterDescriptor(&kernel_descriptor));
+    checkCUDNN(cudnnSetFilter4dDescriptor(kernel_descriptor,
+                                         CUDNN_DATA_HALF,
+                                         CUDNN_TENSOR_NCHW,
+                                         out_channels,
+                                         in_channels,
+                                         kernel_height,
+                                         kernel_width));
+    
+    cudnnConvolutionDescriptor_t convolution_descriptor;
+    checkCUDNN(cudnnCreateConvolutionDescriptor(&convolution_descriptor));
+    checkCUDNN(cudnnSetConvolution2dDescriptor(convolution_descriptor,
+                                              pad_height,
+                                              pad_width,
+                                              stride_height,
+                                              stride_width,
+                                              1,
+                                              1,
+                                              CUDNN_CROSS_CORRELATION,
+                                              CUDNN_DATA_FLOAT));
+    
+ 
+//    checkCUDNN(cudnnSetConvolutionMathType(convolution_descriptor, CUDNN_TENSOR_OP_MATH));
+    
+    int batch_size{0}, channels{0}, height{0}, width{0};
+    checkCUDNN(cudnnGetConvolution2dForwardOutputDim(convolution_descriptor,
+                                                    input_descriptor,
+                                                    kernel_descriptor,
+                                                    &batch_size,
+                                                    &channels,
+                                                    &height,
+                                                    &width));
     
     cudnnTensorDescriptor_t output_descriptor;
     checkCUDNN(cudnnCreateTensorDescriptor(&output_descriptor));
-    checkCUDNN(cudnnSetTensor4dDescriptor(
-        output_descriptor,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        1, out_channels, out_height, out_width
-    ));
+    checkCUDNN(cudnnSetTensor4dDescriptor(output_descriptor,
+                                         CUDNN_TENSOR_NCHW,
+                                         CUDNN_DATA_HALF,
+                                         batch_size,
+                                         channels,
+                                         height,
+                                         width));
     
-    cudnnFilterDescriptor_t filter_descriptor;
-    checkCUDNN(cudnnCreateFilterDescriptor(&filter_descriptor));
-    checkCUDNN(cudnnSetFilter4dDescriptor(
-        filter_descriptor,
-        CUDNN_DATA_HALF,
-        CUDNN_TENSOR_NCHW,
-        out_channels, in_channels, kernel_height, kernel_width
-    ));
+    cudnnConvolutionFwdAlgo_t convolution_algorithm = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
     
-    cudnnConvolutionDescriptor_t conv_descriptor;
-    checkCUDNN(cudnnCreateConvolutionDescriptor(&conv_descriptor));
-    checkCUDNN(cudnnSetConvolution2dDescriptor(
-        conv_descriptor,
-        pad_height, pad_width,
-        stride_height, stride_width,
-        1, 1,
-        CUDNN_CROSS_CORRELATION,
-        CUDNN_DATA_HALF
-    ));
+    size_t workspace_bytes{0};
+    checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnn,
+                                                     input_descriptor,
+                                                     kernel_descriptor,
+                                                     convolution_descriptor,
+                                                     output_descriptor,
+                                                     convolution_algorithm,
+                                                     &workspace_bytes));
     
-    cudnnConvolutionFwdAlgo_t algorithm;
-    checkCUDNN(cudnnGetConvolutionForwardAlgorithm(
-        cudnn,
-        input_descriptor,
-        filter_descriptor,
-        conv_descriptor,
-        output_descriptor,
-        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
-        0,
-        &algorithm
-    ));
-    
-    size_t workspace_bytes = 0;
-    checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(
-        cudnn,
-        input_descriptor,
-        filter_descriptor,
-        conv_descriptor,
-        output_descriptor,
-        algorithm,
-        &workspace_bytes
-    ));
-    
-    void* workspace = nullptr;
+    void* workspace{nullptr};
     if (workspace_bytes > 0) {
         cudaMalloc(&workspace, workspace_bytes);
     }
     
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    const float alpha = 1.0f, beta = 0.0f;
     
-    auto input_nhwc = input.permute({0, 2, 3, 1}).contiguous();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     
-    auto output_nhwc = output.permute({0, 2, 3, 1}).contiguous();
+    cudaEventRecord(start);
     
-    checkCUDNN(cudnnConvolutionForward(
-        cudnn,
-        &alpha,
-        input_descriptor,
-        input_nhwc.data_ptr<at::Half>(),
-        filter_descriptor,
-        filters.data_ptr<at::Half>(),
-        conv_descriptor,
-        algorithm,
-        workspace,
-        workspace_bytes,
-        &beta,
-        output_descriptor,
-        output_nhwc.data_ptr<at::Half>()
-    ));
+    checkCUDNN(cudnnConvolutionForward(cudnn,
+                                     &alpha,
+                                     input_descriptor,
+                                     input.data_ptr<at::Half>(),
+                                     kernel_descriptor,
+                                     filters.data_ptr<at::Half>(),
+                                     convolution_descriptor,
+                                     convolution_algorithm,
+                                     workspace,
+                                     workspace_bytes,
+                                     &beta,
+                                     output_descriptor,
+                                     output.data_ptr<at::Half>()));
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     
     if (workspace) {
         cudaFree(workspace);
     }
+    
     cudnnDestroyTensorDescriptor(input_descriptor);
     cudnnDestroyTensorDescriptor(output_descriptor);
-    cudnnDestroyFilterDescriptor(filter_descriptor);
-    cudnnDestroyConvolutionDescriptor(conv_descriptor);
+    cudnnDestroyFilterDescriptor(kernel_descriptor);
+    cudnnDestroyConvolutionDescriptor(convolution_descriptor);
+    
     cudnnDestroy(cudnn);
     
-    return output_nhwc.permute({0, 3, 1, 2}).contiguous();
+    return std::make_tuple(output, milliseconds);
 }
 
 // Conv2d Layer 2 with cuDNN
-torch::Tensor launch_conv2d_cudnn_v2(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
+std::tuple<torch::Tensor, float> launch_conv2d_cudnn_v2(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
     constexpr int in_channels = 512; // Ni
     constexpr int in_height = 14; // Ny
     constexpr int in_width = 14; // Nx
@@ -149,111 +163,124 @@ torch::Tensor launch_conv2d_cudnn_v2(torch::Tensor input, torch::Tensor filters,
     int pad_height = 0;
     int pad_width = 0;
     
-    int out_height = (in_height - kernel_height + 2 * pad_height) / stride_height + 1;
-    int out_width = (in_width - kernel_width + 2 * pad_width) / stride_width + 1;
+    cudaSetDevice(0);
     
     cudnnHandle_t cudnn;
-    checkCUDNN(cudnnCreate(&cudnn));
+    cudnnCreate(&cudnn);
     
     cudnnTensorDescriptor_t input_descriptor;
     checkCUDNN(cudnnCreateTensorDescriptor(&input_descriptor));
-    checkCUDNN(cudnnSetTensor4dDescriptor(
-        input_descriptor,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        1, in_channels, in_height, in_width
-    ));
+    checkCUDNN(cudnnSetTensor4dDescriptor(input_descriptor,
+                                         CUDNN_TENSOR_NCHW,
+                                         CUDNN_DATA_HALF,
+                                         1,
+                                         in_channels,
+                                         in_height,
+                                         in_width));
+    
+    cudnnFilterDescriptor_t kernel_descriptor;
+    checkCUDNN(cudnnCreateFilterDescriptor(&kernel_descriptor));
+    checkCUDNN(cudnnSetFilter4dDescriptor(kernel_descriptor,
+                                         CUDNN_DATA_HALF,
+                                         CUDNN_TENSOR_NCHW,
+                                         out_channels,
+                                         in_channels,
+                                         kernel_height,
+                                         kernel_width));
+    
+    cudnnConvolutionDescriptor_t convolution_descriptor;
+    checkCUDNN(cudnnCreateConvolutionDescriptor(&convolution_descriptor));
+    checkCUDNN(cudnnSetConvolution2dDescriptor(convolution_descriptor,
+                                              pad_height,
+                                              pad_width,
+                                              stride_height,
+                                              stride_width,
+                                              1,
+                                              1,
+                                              CUDNN_CROSS_CORRELATION,
+                                              CUDNN_DATA_FLOAT));
+    
+ 
+//    checkCUDNN(cudnnSetConvolutionMathType(convolution_descriptor, CUDNN_TENSOR_OP_MATH));
+    
+    int batch_size{0}, channels{0}, height{0}, width{0};
+    checkCUDNN(cudnnGetConvolution2dForwardOutputDim(convolution_descriptor,
+                                                    input_descriptor,
+                                                    kernel_descriptor,
+                                                    &batch_size,
+                                                    &channels,
+                                                    &height,
+                                                    &width));
     
     cudnnTensorDescriptor_t output_descriptor;
     checkCUDNN(cudnnCreateTensorDescriptor(&output_descriptor));
-    checkCUDNN(cudnnSetTensor4dDescriptor(
-        output_descriptor,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        1, out_channels, out_height, out_width
-    ));
+    checkCUDNN(cudnnSetTensor4dDescriptor(output_descriptor,
+                                         CUDNN_TENSOR_NCHW,
+                                         CUDNN_DATA_HALF,
+                                         batch_size,
+                                         channels,
+                                         height,
+                                         width));
     
-    cudnnFilterDescriptor_t filter_descriptor;
-    checkCUDNN(cudnnCreateFilterDescriptor(&filter_descriptor));
-    checkCUDNN(cudnnSetFilter4dDescriptor(
-        filter_descriptor,
-        CUDNN_DATA_HALF,
-        CUDNN_TENSOR_NCHW,
-        out_channels, in_channels, kernel_height, kernel_width
-    ));
+    cudnnConvolutionFwdAlgo_t convolution_algorithm = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
     
-    cudnnConvolutionDescriptor_t conv_descriptor;
-    checkCUDNN(cudnnCreateConvolutionDescriptor(&conv_descriptor));
-    checkCUDNN(cudnnSetConvolution2dDescriptor(
-        conv_descriptor,
-        pad_height, pad_width,
-        stride_height, stride_width,
-        1, 1,
-        CUDNN_CROSS_CORRELATION,
-        CUDNN_DATA_HALF
-    ));
+    size_t workspace_bytes{0};
+    checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnn,
+                                                     input_descriptor,
+                                                     kernel_descriptor,
+                                                     convolution_descriptor,
+                                                     output_descriptor,
+                                                     convolution_algorithm,
+                                                     &workspace_bytes));
     
-    cudnnConvolutionFwdAlgo_t algorithm;
-    checkCUDNN(cudnnGetConvolutionForwardAlgorithm(
-        cudnn,
-        input_descriptor,
-        filter_descriptor,
-        conv_descriptor,
-        output_descriptor,
-        CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
-        0,
-        &algorithm
-    ));
-    
-    size_t workspace_bytes = 0;
-    checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(
-        cudnn,
-        input_descriptor,
-        filter_descriptor,
-        conv_descriptor,
-        output_descriptor,
-        algorithm,
-        &workspace_bytes
-    ));
-    
-    void* workspace = nullptr;
+    void* workspace{nullptr};
     if (workspace_bytes > 0) {
         cudaMalloc(&workspace, workspace_bytes);
     }
     
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    const float alpha = 1.0f, beta = 0.0f;
     
-    auto input_nhwc = input.permute({0, 2, 3, 1}).contiguous();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     
-    auto output_nhwc = output.permute({0, 2, 3, 1}).contiguous();
+    cudaEventRecord(start);
     
-    checkCUDNN(cudnnConvolutionForward(
-        cudnn,
-        &alpha,
-        input_descriptor,
-        input_nhwc.data_ptr<at::Half>(),
-        filter_descriptor,
-        filters.data_ptr<at::Half>(),
-        conv_descriptor,
-        algorithm,
-        workspace,
-        workspace_bytes,
-        &beta,
-        output_descriptor,
-        output_nhwc.data_ptr<at::Half>()
-    ));
+    checkCUDNN(cudnnConvolutionForward(cudnn,
+                                     &alpha,
+                                     input_descriptor,
+                                     input.data_ptr<at::Half>(),
+                                     kernel_descriptor,
+                                     filters.data_ptr<at::Half>(),
+                                     convolution_descriptor,
+                                     convolution_algorithm,
+                                     workspace,
+                                     workspace_bytes,
+                                     &beta,
+                                     output_descriptor,
+                                     output.data_ptr<at::Half>()));
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     
     if (workspace) {
         cudaFree(workspace);
     }
+    
     cudnnDestroyTensorDescriptor(input_descriptor);
     cudnnDestroyTensorDescriptor(output_descriptor);
-    cudnnDestroyFilterDescriptor(filter_descriptor);
-    cudnnDestroyConvolutionDescriptor(conv_descriptor);
+    cudnnDestroyFilterDescriptor(kernel_descriptor);
+    cudnnDestroyConvolutionDescriptor(convolution_descriptor);
+    
     cudnnDestroy(cudnn);
     
-    return output_nhwc.permute({0, 3, 1, 2}).contiguous();
+    return std::make_tuple(output, milliseconds);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

@@ -289,11 +289,11 @@ torch::Tensor launch_conv2d_v1(torch::Tensor input, torch::Tensor filters, torch
     const int k = in_channels * kernel_height * kernel_width;
 
     const int n_padded = CEIL_DIV(n, 64) * 64;
-    printf("n_padded: %d\n", n_padded);
+//    printf("n_padded: %d\n", n_padded);
 
-    printf("M: %d\n", m);
-    printf("N: %d\n", n);
-    printf("K: %d\n", k);
+//    printf("M: %d\n", m);
+//    printf("N: %d\n", n);
+//    printf("K: %d\n", k);
 
     const int num_threads = 8;
     dim3 blockDim(num_threads, num_threads);
@@ -395,7 +395,7 @@ torch::Tensor launch_conv2d_v2(torch::Tensor input, torch::Tensor filters, torch
 
     // Filter_matrix (No x Ni * Kx * Ky), Im2Col_matrix (Ni * Kx * Ky, H_out * W_out)
     // Output: (No, H_out * W_out)
-    filters_reshaped = filters_reshaped.contiguous();
+    filters_reshaped = filters_reshaped.t().contiguous();
     matmul<<<gridDim, blockDim>>>(
         reinterpret_cast<half*>(filters_reshaped.data_ptr<at::Half>()),
         reinterpret_cast<half*>(col_buffer.data_ptr<at::Half>()),
