@@ -1,7 +1,7 @@
 #include <mma.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
-// #include <ptx.h>
+#include "ptx.h"
 
 #define CUDA_KERNEL_LOOP_TYPE(i, n, index_type)                         \
   int64_t _i_n_d_e_x = ((int64_t) blockIdx.x) * blockDim.x + threadIdx.x;           \
@@ -120,87 +120,81 @@ void im2col(
 }
 
 __global__ void matmul(half* A, half* B, float* C, const int m, const int n, const int d){
-    int i = blockIdx.x*blockDim.x + threadIdx.x;
-    int j = blockIdx.y*blockDim.y + threadIdx.y;
+    // A is (m,d), B is (d,n), C is (m,n)
+       
+    __shared__ half As[8][64];
+    __shared__ half Bs[8][64];
 
-    if(i < m && j < n){
-        float inner_prod = 0.0f;
-        for(int k = 0; k < d; k++){
-            inner_prod += __half2float(A[i*d+k]) * __half2float(B[k*n+j]);
+
+    float C_local[8][8];
+    for (int ib = 0; ib < 8; ++ib) {
+        for (int jb = 0; jb < 8; ++jb) {
+            C_local[ib][jb] = 0;
         }
-        C[i*n+j] = inner_prod;
     }
-}
 
-template <const uint Nx, const uint Ny, 
-         const uint Kx, const uint Ky, 
-         const uint Ni, const uint Nn, 
-         const uint stride>
-__global__ void conv2d_v2(const half* input, const half* filter, float* output) {
-    printf("hi");
+    for (int k = 0; k < d; k+=8) {
+        // each thread will load 8 elements into SRAM
+        int local_thread = threadIdx.y * blockDim.x + threadIdx.x; //0-63 threads
+        int i = blockIdx.x * 64 + local_thread;
+        int j = blockIdx.y * 64 + local_thread;
 
-    constexpr uint OUT_H = (Ny - Ky) / stride + 1;
-    constexpr uint OUT_W = (Nx - Kx) / stride + 1;
+        for(int f = 0; f < 8; f++){
+            int local_k = k + f;
+            As[f][local_thread] = A[local_k*m + i];
+            Bs[f][local_thread] = B[local_k*n + j];
+        }
+        __syncthreads();
+        
+        #pragma unroll
+        for(int f = 0; f < 8; f++){
+            half x[8];
+            half y[8];
 
-    int idx = blockIdx.x*blockDim.x + threadIdx.x;
-    int height_col = (OUT_H*OUT_W);
-    int width_col = (Kx*Ky);
-    int pad = 0;
+  //          uint32_t Areg[4];
+  //          uint32_t Breg[2];
+            for (int ib = 0; ib < 8; ++ib) {
+                x[ib] = As[f][ib*8+threadIdx.x];
+//                load_matrix_x4(Areg, As[f][ib*8+threadIdx.x]);
+                for (int jb = 0; jb < 8; ++jb) {
+                    y[jb] = Bs[f][jb*8+threadIdx.y];
+//                    load_matrix_x2(Breg, Bs[f][ib*8+threadIdx.x]);
+                    //reuse x[ib] and y[jb]
+   //                 half temp = __hmul(x[ib], y[jb]);
+                    C_local[ib][jb] += __half2float(x[ib]) * __half2float(y[jb]);
 
-    half im2col_matrix[OUT_H * OUT_W * (Kx*Ky)];
-    half filter_matrix[Kx*Ky * Nn];
 
-    for (int c = 0; c < Ni; c++){
-        int w_out = idx % width_col;
-        int h_idx = idx / width_col;
-        int h_out = h_idx % height_col;
+ //                   float Creg[4] = {0, 0, 0, 0};
+//                    mma_m16n8k8(Areg, Breg, Creg, Creg);
+                    // not sure if im doing the Creg correctly?
+ //                   C_local[ib][jb] += Creg[0] + Creg[1] + Creg[2] + Creg[3];
 
-        int h_in = h_out * stride - pad;
-        int w_in = w_out * stride - pad;
-
-        for (int i = 0; i < Ky; ++i) {
-            for (int j = 0; j < Kx; ++j) {
-                int h = h_in + i;
-                int w = w_in + j;
-
-                im2col_matrix[(h_out * width_col + w_out) * width_col + (i*Kx + j)] =
-                    (h >= 0 && w >= 0 && h < Ny && w < Nx) ?
-                    input[c*Nx*Ny + (h*Nx + w)] : __float2half(0.0f);
-                
-                for (int oc = 0; oc < Ny; oc++){
-                    filter_matrix[(i*Kx + j) * Nn + oc] = filter[oc*Ni*Kx*Ky + (i*Kx+j)];
                 }
             }
         }
+        __syncthreads();
+    }
 
-        print_matrix("im2col", im2col_matrix, height_col, width_col);
-        print_matrix("filter", filter_matrix, Kx*Ky, Nn);
-
-        int i = blockIdx.x*blockDim.x + threadIdx.x;
-        int j = blockIdx.y*blockDim.y + threadIdx.y;
-
-        int M = h_out * w_out;
-        int N = Ni;
-        int K = Kx*Ky;
-        
-        if(i < M && j < N){
-            float inner_prod = 0.0f;
-            for(int k = 0; k < K; k++){
-                inner_prod += __half2float(im2col_matrix[i*K+k]) * __half2float(filter_matrix[k*N+j]);
+    for (int ib = 0; ib < 8; ++ib) {
+        for (int jb = 0; jb < 8; ++jb) {
+            int i = blockIdx.x * 64 + ib * 8 + threadIdx.x;
+            int j = blockIdx.y * 64 + jb * 8 + threadIdx.y;
+            if (i < m && j < n) {
+                C[i*n + j] = C_local[ib][jb];
             }
-            output[i*N+j] = inner_prod;
         }
     }
 }
 
 torch::Tensor launch_conv2d_v1(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
-    auto in_channels = input.size(1);
-    auto in_height = input.size(2);
-    auto in_width = input.size(3);
+    /* Conv2d version 1 parameters */
+    constexpr int in_channels = 64; // Ni
+    constexpr int in_height = 224; // Ny
+    constexpr int in_width = 224; // Nx
     
-    auto out_channels = filters.size(0);
-    auto kernel_height = filters.size(2);
-    auto kernel_width = filters.size(3);
+    constexpr int out_channels = 64; // Nn
+    constexpr int kernel_height = 3; // Ky
+    constexpr int kernel_width = 3; // Kx
     
     int stride_height = 1;
     int stride_width = 1;
@@ -209,8 +203,8 @@ torch::Tensor launch_conv2d_v1(torch::Tensor input, torch::Tensor filters, torch
     int dilation_height = 1;
     int dilation_width = 1;
     
-    auto out_height = (in_height - kernel_height + 2 * pad_height) / stride_height + 1;
-    auto out_width = (in_width - kernel_width + 2 * pad_width) / stride_width + 1;
+    int out_height = (in_height - kernel_height + 2 * pad_height) / stride_height + 1;
+    int out_width = (in_width - kernel_width + 2 * pad_width) / stride_width + 1;
     
     auto col_buffer = torch::empty({in_channels * kernel_height * kernel_width, out_height * out_width},
                                   input.options());
@@ -244,15 +238,27 @@ torch::Tensor launch_conv2d_v1(torch::Tensor input, torch::Tensor filters, torch
     const int m = out_channels;
     const int n = out_height * out_width;
     const int k = in_channels * kernel_height * kernel_width;
-    
-    const int num_threads = 16;
+
+    const int n_padded = CEIL_DIV(n, 64) * 64;
+  //  printf("n_padded: %d\n", n_padded);
+
+  //  printf("M: %d\n", m);
+  //  printf("N: %d\n", n);
+  //  printf("K: %d\n", k);
+
+    const int num_threads = 8;
     dim3 blockDim(num_threads, num_threads);
-    const int grid_size_x = (m + num_threads - 1) / num_threads;
-    const int grid_size_y = (n + num_threads - 1) / num_threads;
+
+    const int grid_size_x = (m+63)/64;
+    const int grid_size_y = (n+63)/64;
     dim3 gridDim(grid_size_x, grid_size_y);
+    
+ //    dim3 blockDim(16,16);
+ //   dim3 gridDim((m/64),(n/64));
 
     // Filter_matrix (No x Ni * Kx * Ky), Im2Col_matrix (Ni * Kx * Ky, H_out * W_out)
     // Output: (No, H_out * W_out)
+    filters_reshaped = filters_reshaped.t().contiguous();
     matmul<<<gridDim, blockDim>>>(
         reinterpret_cast<half*>(filters_reshaped.data_ptr<at::Half>()),
         reinterpret_cast<half*>(col_buffer.data_ptr<at::Half>()),
@@ -263,43 +269,90 @@ torch::Tensor launch_conv2d_v1(torch::Tensor input, torch::Tensor filters, torch
     return output;
 }
 
-torch::Tensor launch_conv2d_v2(torch::Tensor input, torch::Tensor filters, torch::Tensor output){
-    const uint Nx = 224;
-    const uint Ny = 224;
-    const uint Kx = 3;
-    const uint Ky = 3;
-    const uint Ni = 64;
-    const uint Nn = 64;
-    const uint stride = 1;
-    const uint BLOCK_SIZE = 16;
-
-    constexpr uint OUT_H = (Ny - Ky) / stride + 1;
-    constexpr uint OUT_W = (Nx - Kx) / stride + 1;
-
-    dim3 dim_block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 dim_grid(CEIL_DIV(OUT_H * OUT_W, BLOCK_SIZE),
-            CEIL_DIV(Nn, BLOCK_SIZE));
-
-    printf("Before kernel launch\n");
-    conv2d_v2<Nx, Ny, Kx, Ky, Ni, Nn, stride>
-    <<<dim_grid, dim_block>>>(
-        reinterpret_cast<half*>(input.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(filters.data_ptr<at::Half>()),
-        output.data_ptr<float>()
+torch::Tensor launch_conv2d_v2(torch::Tensor input, torch::Tensor filters, torch::Tensor output) {
+    /* Conv2d version 2 parameters */
+    constexpr int in_channels = 512; // Ni
+    constexpr int in_height = 14; // Ny
+    constexpr int in_width = 14; // Nx
+    
+    constexpr int out_channels = 512; // Nn
+    constexpr int kernel_height = 3; // Ky
+    constexpr int kernel_width = 3; // Kx
+    
+    int stride_height = 1;
+    int stride_width = 1;
+    int pad_height = 0;
+    int pad_width = 0;
+    int dilation_height = 1;
+    int dilation_width = 1;
+    
+    int out_height = (in_height - kernel_height + 2 * pad_height) / stride_height + 1;
+    int out_width = (in_width - kernel_width + 2 * pad_width) / stride_width + 1;
+    
+    auto col_buffer = torch::empty({in_channels * kernel_height * kernel_width, out_height * out_width},
+                                  input.options());
+    
+    auto input_no_batch = input.squeeze(0);
+    auto filters_reshaped = filters.view({out_channels, in_channels * kernel_height * kernel_width});
+    
+    cudaStream_t stream = 0; // use main stream
+    
+    im2col<at::Half>(
+        stream,
+        input_no_batch.data_ptr<at::Half>(),
+        in_channels,
+        in_height,
+        in_width,
+        out_height,
+        out_width,
+        kernel_height,
+        kernel_width,
+        pad_height,
+        pad_width,
+        stride_height,
+        stride_width,
+        dilation_height,
+        dilation_width,
+        col_buffer.data_ptr<at::Half>()
     );
 
-    cudaDeviceSynchronize();
-    printf("After kernel launch\n");
+    auto output_reshaped = output.squeeze(0).view({out_channels, out_height * out_width});
     
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        printf("CUDA error: %s\n", cudaGetErrorString(error));
-    }
+    const int m = out_channels;
+    const int n = out_height * out_width;
+    const int k = in_channels * kernel_height * kernel_width;
 
+    const int n_padded = CEIL_DIV(n, 64) * 64;
+ //   printf("n_padded: %d\n", n_padded);
+
+ //   printf("M: %d\n", m);
+ //   printf("N: %d\n", n);
+ //   printf("K: %d\n", k);
+
+    const int num_threads = 8;
+    dim3 blockDim(num_threads, num_threads);
+
+    const int grid_size_x = (m+63)/64;
+    const int grid_size_y = (n+63)/64;
+    dim3 gridDim(grid_size_x, grid_size_y);
+    
+ //    dim3 blockDim(16,16);
+ //   dim3 gridDim((m/64),(n/64));
+
+    // Filter_matrix (No x Ni * Kx * Ky), Im2Col_matrix (Ni * Kx * Ky, H_out * W_out)
+    // Output: (No, H_out * W_out)
+    filters_reshaped = filters_reshaped.t().contiguous();
+    matmul<<<gridDim, blockDim>>>(
+        reinterpret_cast<half*>(filters_reshaped.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(col_buffer.data_ptr<at::Half>()),
+        output_reshaped.data_ptr<float>(),
+        m, n, k
+    );
+    
     return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv2d_v1", &launch_conv2d_v1, "im2col + gemm");
-    m.def("conv2d_v2", &launch_conv2d_v2, "fused im2col + gemm");
+    m.def("conv2d_v2", &launch_conv2d_v2, "im2col + gemm");
 }
