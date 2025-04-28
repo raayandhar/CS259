@@ -1,5 +1,5 @@
 // class1.cu — fp16 matvec
-// Compile: nvcc -O3 -arch=sm_89 class1.cu -lcublas -o class1
+// Compile: nvcc -O3 -arch=sm_86 class1.cu -lcublas -o class1
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -13,20 +13,29 @@
 #define WARPS_PER_BLOCK 4
 #define THREADS_PER_BLOCK (WARPS_PER_BLOCK * 32)
 
-// class1
+/* class1: A GEMV kernel operating on fp16 data
+
+W @ x = y
+
+W: Nn x Ni
+x: Ni
+y: Nn
+*/
 __global__ void class1(const __half* __restrict__ W, const __half* __restrict__ x,  __half* __restrict__ y)
 {
     const int warp_id = threadIdx.x >> 5; // 0...3
     const int lane  = threadIdx.x & 31; // 0..31
     const int out_idx = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     if (out_idx >= Nn) return;
-
+    // We multiply row Wi with x to get yi.
+    
     const __half* w_row = W + static_cast<size_t>(out_idx) * Ni;
 
     // On sm_8x arch, fp16->fp32 promotion is basically free in the
     // CUDA core datapath, so casting back to half costs nothing
     // ff: vector dp almost always accumulates in fp32 anyways
     float acc = 0.0f;
+
 #pragma unroll 4
     for (int i = lane; i < Ni; i += 32)
         acc += __half2float(w_row[i]) * __half2float(x[i]);    // 
