@@ -105,7 +105,7 @@ void benchmark()
     cudaEventElapsedTime(&ms_class1, start, stop);
     ms_class1 /= ITER;
     double gflop = 2.0 * Ni * Nn * 1e-6;
-    std::cout << "[class1] " << ms_class1 << " ms (" << gflop / ms_class1 << " GFLOP/s)\n";
+    std::cout << "[class2] " << ms_class1 << " ms (" << gflop / ms_class1 << " GFLOP/s)\n";
 
     cublasHandle_t handle; 
     cublasCreate(&handle);
