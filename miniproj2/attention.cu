@@ -30,19 +30,15 @@ __global__ void forward_kernel(const float* Q, const float* K, const float* V, f
     for(int j = 0; j < Tc; j++) {
         // Load Kj, Vj
         for(int k = 0; k < d; k++){
-            if(j*Bc*d + ty*d < N*d){ // 31 < 33
-                Kj[ty*d + k] = K[bnhNd + hNd + j*Bc*d + (ty*d + k)];
-                Vj[ty*d + k] = V[bnhNd + hNd + j*Bc*d + (ty*d + k)];
-            }
+            Kj[ty*d + k] = K[bnhNd + hNd + j*Bc*d + (ty*d + k)];
+            Vj[ty*d + k] = V[bnhNd + hNd + j*Bc*d + (ty*d + k)];
         }
         __syncthreads();
         
         // Load Qi
         for(int i = 0; i < Tr; i++) {
             for(int k = 0; k < d; k++){
-                if(i*Br*d+(tx*d) < N*d){
-                    Qi[tx*d + k] = Q[bnhNd + hNd + i*Br*d + (tx*d + k)];
-               }
+                Qi[tx*d + k] = Q[bnhNd + hNd + i*Br*d + (tx*d + k)];
             }
             __syncthreads();
 
@@ -75,10 +71,8 @@ __global__ void forward_kernel(const float* Q, const float* K, const float* V, f
 
             float lij = 0.0f;
             for(int jj = 0; jj < Bc; jj++){
-                if(i*Br+tx < N && j*Bc + jj < N){
-                    float val = Sij[tx*Bc+jj];
-                    lij += val;
-                }
+                float val = Sij[tx*Bc+jj];
+                lij += val;
             }
             
             __syncthreads();
@@ -91,9 +85,7 @@ __global__ void forward_kernel(const float* Q, const float* K, const float* V, f
             for(int k = 0; k < d; k++){
                 float PijVj = 0.0f;
                 for(int jj = 0; jj < Bc; jj++){
-                    if(i*Br+tx < N && j*Bc + jj < N){
-                        PijVj += Sij[tx*Bc + jj] * Vj[jj*d + k];
-                    }
+                    PijVj += Sij[tx*Bc + jj] * Vj[jj*d + k];
                 }
 
                 if(i*Br*d + tx*d < N*d){
@@ -113,8 +105,8 @@ __global__ void forward_kernel(const float* Q, const float* K, const float* V, f
 }
 
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O, torch::Tensor l, torch::Tensor m, const int bz, const int nh, const int N, const int d) {
-    int Br = 32;
-    int Bc = 32;
+    int Br = 16;
+    int Bc = 16;
 
     const int Tr = (N + Br - 1) / Br;
     const int Tc = (N + Bc - 1) / Bc;
