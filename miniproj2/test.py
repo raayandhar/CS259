@@ -27,10 +27,22 @@ def manual_attn(q, k, v):
     return y
 
 def main():
+    [64, 128, 256, 512, 1024, 2048]
     B = 1 
     H = 4 
-    N = 128
+    N = 64 
     d = 32 
+
+    # 64:  3.0249 ms,  0.6451
+    # 128:  11.7762 ms, 2.2508
+    # 256:  46.0249 ms, 8.7235
+    # 512:  186.5626 ms, 34.5702
+
+    # Br, Bc, N=128
+    # 16, 16: 2.2569 ms
+    # 32, 32: 11.7762 ms
+    # 64, 16: 3.8963
+    # 16, 64: 11.5999 ms
 
     Q = torch.randn((B, H, N, d), device='cuda', dtype=torch.float32)
     K = torch.randn((B, H, N, d), device='cuda', dtype=torch.float32)
