@@ -17,8 +17,8 @@ l2_size = 6 * 1024 * 1024
 ### Functions for our model ###        
 def compute_flops(B, H, N, d, Br, Bc):
     """Compute total FLOPS for flash attention"""
-    Tr = math.ceil(N / Br)
-    Tc = math.ceil(N / Bc)
+    Tr = math.ceil(N / Br) # number of query tiles
+    Tc = math.ceil(N / Bc) # number of key/value tiles
     flops_qk = 0
     flops_mij = 0
     flops_pij = 0
@@ -30,14 +30,14 @@ def compute_flops(B, H, N, d, Br, Bc):
     
     for i in range(Tr):
         for j in range(Tc):
-            flops_qk += 2 * Br * Bc * d 
-            flops_mij += Br * Bc 
-            flops_pij += 2 * Br * Bc
-            flops_lij += Br * Bc
-            flops_mi_new += Br 
-            flops_li_new += 6 * Br
-            flops_pijv += 2 * Br * Bc * d
-            flops_oi += 10 * Br * d
+            flops_qk += 2 * Br * Bc * d # matmul: Q_i tile (Br, d) @ K_j^T tile (Bc, d) -> Br * Bc dot products, requiring one multiply and one add per position
+            flops_mij += Br * Bc # for finding maximum of attention map tile
+            flops_pij += 2 * Br * Bc # for finding exponents of attention map tile
+            flops_lij += Br * Bc # for computing sum of exponents
+            flops_mi_new += Br # updating global max (global max = max(local max, global max))
+            flops_li_new += 6 * Br # updating global sum of exponents (__expf(mi_old) - mi_new) * li_old + __expf(mij-mi_new) * lij) -> 6 flops per tile
+            flops_pijv += 2 * Br * Bc * d # matmul: attention tile (Br, Bc) @ V_j^T tile (Bc, d) -> Br * Bc dot products
+            flops_oi += 10 * Br * d # summing contribution of partial product in output matrix
     
     total_flops = B * H * (flops_qk + flops_mij + flops_pij + 
                             flops_lij + flops_mi_new + flops_li_new + 
@@ -125,18 +125,18 @@ def compute_execution_times(B, H, N, d, Br, Bc):
     bank_conflict_factor = 6.5
 
     # Our model
-    compute_time = (flops / peak_compute) * 1000
+    compute_time = (flops / peak_compute) * 1000 # milliseconds
     our_dram_time = (dram_total / (dram_bandwidth * 0.01)) * 1000
     l2_time = (l2_total / (l2_bandwidth * 0.01)) * 1000
     l1_time = (l1_total / (l1_bandwidth * 0.1)) * bank_conflict_factor * 1000
 
     # Simple roofline model (assume peak bandwith)
     compute_time = (flops / peak_compute) * 1000
-    roofline_dram_time = ((dram_total * 3) / (dram_bandwidth)) * 1000
+    roofline_dram_time = (dram_total / (dram_bandwidth)) * 1000
     
     times = [compute_time, our_dram_time, l2_time, l1_time]
     bottleneck_time = max(times)
-    simple_roofline_time = min(compute_time, roofline_dram_time)
+    simple_roofline_time = max(compute_time, roofline_dram_time)
     bottlenecks = ["Compute", "DRAM", "L2 Cache", "L1 Cache"]
     bottleneck = bottlenecks[times.index(max(times))]
     
@@ -157,7 +157,8 @@ def graph_tiles_sizes(B, H, N, d):
     roofline_times = []  
     
     for Br, Bc in tile_configs:
-        _, _, _, _, bottleneck_time, roofline_time, _ = compute_execution_times(B, H, N, d, Br, Bc)
+        _, _, _, _, bottleneck_time, roofline_time, bottleneck = compute_execution_times(B, H, N, d, Br, Bc)
+        print(f"Bottleneck: {bottleneck}")
         predicted_times.append(bottleneck_time)
         roofline_times.append(roofline_time)
     
@@ -282,6 +283,6 @@ if __name__ == "__main__":
         print(f"(Simple roofline model) Predicted execution time: {roofline_time:.6f} ms")
         print(f"(Actual execution time: {actual_time[N_values.index(N)]:.6f} ms)")
     
-    N = 64 
+    N = 128 
     graph_tiles_sizes(B, H, N, d)
     graph_sequence_lengths(B, H, d)
